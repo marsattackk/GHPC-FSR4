@@ -7,10 +7,8 @@ GHPC runs on Direct3D 11 and FSR 4 only runs on Direct3D 12, so the mod basicall
 its own next to the game's and hands the frame back and forth every frame. Reticles, depth of field, bloom and the rest
 of the game's effects are drawn after FSR, at full resolution, so the sights stay sharp.
 
-> **Heads up: this is a janky mod.** Bolting a Direct3D 12 upscaler onto a Direct3D 11 game is a hack, and it might
-> cause issues: visual glitches, crashes, or worse performance than without it. I built it for my own system and
-> hardware specifically (a Radeon RX 9070 XT at 4K), and that's the only setup it's actually been tested on. If it
-> works on yours, great, if it doesn't, delete the DLL and you're back to the normal game.
+> [!WARNING]
+> **This is a janky mod.** Bolting a Direct3D 12 upscaler onto a Direct3D 11 game is a hack, and it might cause issues: visual glitches, crashes, or worse performance than without it. I built it for my own system and hardware specifically (a Radeon RX 9070 XT at 4K), and that's the only setup it's actually been tested on. If it works on yours, great, if it doesn't, delete the DLL and you're back to the normal game.
 
 This README describes **version 0.1.0**. No other mod needed, just MelonLoader. The mod is a single DLL, nothing else
 to install.
