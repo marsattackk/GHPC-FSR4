@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <deque>
@@ -57,6 +58,7 @@ struct Stats
 	uint32_t contextStarts;
 	int32_t removedReason;
 	uint32_t failures;
+	// gpuPeriodMs down to markMs stay at zero in this build, nothing fills them. Left in so the layout still matches Native.cs.
 	float gpuPeriodMs, gpuPeriodMin, gpuPeriodMax;
 	float gpuBusyMs, gpuBusyMin, gpuBusyMax;
 	uint64_t gpuFrames;
@@ -67,6 +69,30 @@ struct Stats
 	uint32_t exposureWanted;
 	uint64_t directFrames;
 };
+
+static_assert(sizeof(void*) == 8, "64-bit only");
+static_assert(sizeof(FrameData) == 112, "FrameData changed: update Native.cs, kFrameFields and this size");
+static_assert(sizeof(Stats) == 520, "Stats changed: update Native.cs, kStatsFields and this size");
+
+struct LayoutField { const char* name; uint32_t offset; };
+#define LF(T, f) { #f, (uint32_t)offsetof(T, f) }
+static const LayoutField kFrameFields[] = {
+	LF(FrameData, color), LF(FrameData, depth), LF(FrameData, motion), LF(FrameData, output),
+	LF(FrameData, renderW), LF(FrameData, renderH), LF(FrameData, displayW), LF(FrameData, displayH),
+	LF(FrameData, jitterX), LF(FrameData, jitterY), LF(FrameData, mvScaleX), LF(FrameData, mvScaleY),
+	LF(FrameData, frameTimeMs), LF(FrameData, cameraNear), LF(FrameData, cameraFar), LF(FrameData, fovV),
+	LF(FrameData, sharpness), LF(FrameData, reset), LF(FrameData, createFlags), LF(FrameData, dispatchFlags),
+	LF(FrameData, exposure), LF(FrameData, direct), LF(FrameData, maxRenderW), LF(FrameData, maxRenderH),
+};
+static const LayoutField kStatsFields[] = {
+	LF(Stats, frames), LF(Stats, providerId), LF(Stats, lastResult), LF(Stats, failed), LF(Stats, provider),
+	LF(Stats, adapter), LF(Stats, presented), LF(Stats, cpuMs), LF(Stats, gpuMs), LF(Stats, fsrMemory),
+	LF(Stats, logDropped), LF(Stats, bridgeStarts), LF(Stats, contextStarts), LF(Stats, removedReason), LF(Stats, failures),
+	LF(Stats, gpuPeriodMs), LF(Stats, gpuPeriodMin), LF(Stats, gpuPeriodMax), LF(Stats, gpuBusyMs), LF(Stats, gpuBusyMin),
+	LF(Stats, gpuBusyMax), LF(Stats, gpuFrames), LF(Stats, gpuDisjoint), LF(Stats, gpuDropped), LF(Stats, markMs),
+	LF(Stats, flushMs), LF(Stats, exposureWanted), LF(Stats, directFrames),
+};
+#undef LF
 
 namespace
 {
@@ -144,6 +170,7 @@ namespace
 		bool loaded = false;
 		std::atomic<bool> failed{ false };
 		bool teardownDue = false;
+		std::atomic<bool> fatal{ false };
 
 		ID3D11Device* d11Base = nullptr;
 		ComPtr<ID3D11Device5> d11;
@@ -654,6 +681,7 @@ namespace
 	}
 
 	struct Handed { float nearM, farM, sharpness, preExposure, exposure; uint32_t createFlags, dispatchFlags; };
+	// Leftover, nothing reads g_handed in this build. Does no harm.
 	Handed g_handed = { -1 };
 
 	void TimingMark(int code);
@@ -666,6 +694,7 @@ namespace
 		float exposure = !g.exposureRequired || !(handed.exposure > 0) ? 0.0f : handed.exposure;
 		if (exposure > 0) fd.createFlags &= ~(uint32_t)FFX_UPSCALE_ENABLE_AUTO_EXPOSURE;
 		float preExposure = 1.0f;
+		// expStep only ever fed a log line that isn't in this build, it's dead weight now.
 		float expStep = exposure > 0 ? floorf(log2f(exposure) * 4.0f + 0.5f) : -1000.0f;
 		(void)expStep;
 
@@ -779,6 +808,7 @@ namespace
 	}
 
 	const int TCodes = 48;
+	// Does nothing in this build. The calls stay cos stripping them out wasn't worth touching the render event for.
 	void TimingMark(int) {}
 
 	void __stdcall OnRenderEvent(int eventId, void* data)
@@ -805,11 +835,13 @@ namespace
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
+			DWORD code = GetExceptionCode();
+			if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == EXCEPTION_STACK_OVERFLOW) g.fatal = true;
 			g.teardownDue = true;
 			g.errors = 0;
 			g.stats.failures++;
 			g.failed = true;
-			Log("FSR stopped: exception 0x%08X on the render thread.", (unsigned)GetExceptionCode());
+			Log("FSR stopped: exception 0x%08X on the render thread%s.", (unsigned)code, g.fatal ? " (a memory fault: off until the game restarts)" : "");
 		}
 		Publish();
 	}
@@ -862,7 +894,19 @@ EXPORT void FSR4_GetStats(Stats* out)
 	out->logDropped = g_logDropped;
 }
 
-EXPORT int FSR4_Failed() { return g.failed ? 1 : 0; }
+EXPORT int FSR4_LayoutField(int which, int i, const char** name, uint32_t* offset)
+{
+	if (!name || !offset || which < 0 || which > 1) return 0;
+	const LayoutField* f = which == 0 ? kFrameFields : kStatsFields;
+	int n = which == 0 ? (int)(sizeof kFrameFields / sizeof *kFrameFields) : (int)(sizeof kStatsFields / sizeof *kStatsFields);
+	if (i == -1) { *name = which == 0 ? "FrameData" : "Stats"; *offset = which == 0 ? (uint32_t)sizeof(FrameData) : (uint32_t)sizeof(Stats); return 1; }
+	if (i < 0 || i >= n) return 0;
+	*name = f[i].name;
+	*offset = f[i].offset;
+	return 1;
+}
+
+EXPORT int FSR4_Failed() { return g.fatal ? 2 : g.failed ? 1 : 0; }
 
 EXPORT int FSR4_ExposureWanted() { return g.exposureRequired ? 1 : 0; }
 
@@ -887,4 +931,4 @@ EXPORT void FSR4_ViewsInUse(uint64_t gen)
 	}
 }
 
-EXPORT void FSR4_ClearFailure() { g.failed = false; }
+EXPORT void FSR4_ClearFailure() { if (!g.fatal) g.failed = false; }

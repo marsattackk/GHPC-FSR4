@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using MelonLoader;
 using UnityEngine;
@@ -48,14 +49,17 @@ namespace FSR4
 			}
 		}
 
+		static readonly List<Canvas> _canvases = new List<Canvas>();
+		static readonly List<CanvasGroup> _groups = new List<CanvasGroup>();
+
 		internal static bool Shown()
 		{
 			foreach (var v in _viewers)
 			{
 				if (v == null || !v.isActiveAndEnabled || v.texture != _target) continue;
 				bool visible = true;
-				foreach (var c in v.GetComponentsInParent<Canvas>(true)) if (!c.enabled) { visible = false; break; }
-				if (visible) foreach (var g in v.GetComponentsInParent<CanvasGroup>(true)) if (g.enabled && g.alpha <= 0f) { visible = false; break; }
+				foreach (var c in _canvases) if (!c.enabled) { visible = false; break; }
+				if (visible) foreach (var g in _groups) if (g.enabled && g.alpha <= 0f) { visible = false; break; }
 				if (visible) return true;
 			}
 			return false;

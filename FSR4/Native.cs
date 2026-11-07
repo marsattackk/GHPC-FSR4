@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using MelonLoader;
@@ -40,6 +41,7 @@ namespace FSR4
 			public uint BridgeStarts, ContextStarts;
 			public int RemovedReason;
 			public uint Failures;
+			// GpuPeriodMs to MarkMs are always zero here, kept only so the struct lines up with bridge.cpp byte for byte.
 			public float GpuPeriodMs, GpuPeriodMin, GpuPeriodMax, GpuBusyMs, GpuBusyMin, GpuBusyMax;
 			public ulong GpuFrames, GpuDisjoint, GpuDropped;
 			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 48)] public float[] MarkMs;
@@ -61,10 +63,12 @@ namespace FSR4
 		[DllImport(Dll)] static extern int FSR4_ExposureWanted();
 		[DllImport(Dll)] internal static extern ulong FSR4_GetViews(out IntPtr color, out IntPtr motion, out IntPtr output);
 		[DllImport(Dll)] internal static extern void FSR4_ViewsInUse(ulong gen);
+		[DllImport(Dll)] static extern int FSR4_LayoutField(int which, int i, out IntPtr name, out uint offset);
 		internal const uint DirectColor = 1, DirectOutput = 2, DirectMotion = 4;
 		internal static bool ExposureWanted => FSR4_ExposureWanted() != 0;
 
 		internal static bool Failed => FSR4_Failed() != 0;
+		internal static bool Fatal => FSR4_Failed() == 2;
 
 		internal static bool Ready { get; private set; }
 
@@ -95,6 +99,7 @@ namespace FSR4
 				bool ok = FSR4_Load(dir) == 1;
 				Poll();
 				if (!ok) return false;
+				if (!LayoutMatches(0, typeof(FrameData)) | !LayoutMatches(1, typeof(Stats))) return false;
 				RenderEvent = FSR4_GetRenderEventFunc();
 				Ready = true;
 				return true;
@@ -104,6 +109,31 @@ namespace FSR4
 				MelonLogger.Error($"{Mod.Name}: native part failed to load: {e.Message}");
 				return false;
 			}
+		}
+
+		static bool LayoutMatches(int which, Type t)
+		{
+			FSR4_LayoutField(which, -1, out var np, out uint size);
+			string sname = Marshal.PtrToStringAnsi(np);
+			var mine = t.GetFields(BindingFlags.Public | BindingFlags.Instance);
+			var problems = new System.Collections.Generic.List<string>();
+			if (Marshal.SizeOf(t) != size) problems.Add($"size {Marshal.SizeOf(t)} here, {size} in the native part");
+			int n = 0;
+			for (; FSR4_LayoutField(which, n, out np, out uint offset) == 1; n++)
+			{
+				string name = Marshal.PtrToStringAnsi(np);
+				var f = Array.Find(mine, m => m.Name.Equals(name, StringComparison.OrdinalIgnoreCase));
+				if (f == null) { problems.Add($"{name} missing here"); continue; }
+				int at = (int)Marshal.OffsetOf(t, f.Name);
+				if (at != offset) problems.Add($"{f.Name} at {at} here, {offset} in the native part");
+			}
+			if (n != mine.Length) problems.Add($"{mine.Length} fields here, {n} in the native part");
+			if (problems.Count == 0)
+			{
+				return true;
+			}
+			MelonLogger.Error($"{Mod.Name}: the mod's two halves disagree on {sname} ({string.Join("; ", problems)}); FSR stays off.");
+			return false;
 		}
 
 		static void Write(string path, byte[] bytes)

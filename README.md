@@ -27,7 +27,8 @@ To remove it, delete `Mods\FSR4.dll` and the `UserData\FSR4` folder.
 
 ## Modes
 
-Press **F9** in game to step through them, or set one in the settings.
+Press **F9** in game to step through them (Auto and Off are in the cycle too), or set one in the settings. The new mode
+shows at the top of the screen for a couple of seconds.
 
 | Mode | At 1080p renders at | At 4K renders at |
 |---|---|---|
@@ -72,6 +73,7 @@ After the first start, `UserData\MelonPreferences.cfg` has an `[FSR 4]` section 
 | `Auto minimum scale` | Auto only, 1.0 is full resolution | 1.0 |
 | `Auto maximum scale` | Auto only, 2.0 is Performance | 2.0 |
 | `Cycle key` | F1-F15, A-Z, 0-9 or None | F9 |
+| `Show mode on screen` | true / false | true |
 
 The camera switches are in `[FSR4_Performance]`: `FpCameraIdle`, `FpCameraNoShadows`, `DistortionCameraForward` and
 `MapCameraIdle` (on), `InstancerCameraFilter` (off, no measurable gain).
