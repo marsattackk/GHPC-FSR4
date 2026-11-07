@@ -1,0 +1,140 @@
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using MelonLoader;
+using MelonLoader.Utils;
+
+namespace FSR4
+{
+	internal static class Native
+	{
+		const string Dll = "FSR4Bridge";
+		static readonly string[] Files = { "FSR4Bridge.dll", "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll" };
+
+		[StructLayout(LayoutKind.Sequential)]
+		internal struct FrameData
+		{
+			public IntPtr Color, Depth, Motion, Output;
+			public uint RenderW, RenderH, DisplayW, DisplayH;
+			public float JitterX, JitterY, MvScaleX, MvScaleY;
+			public float FrameTimeMs, CameraNear, CameraFar, FovV;
+			public float Sharpness;
+			public int Reset;
+			public uint CreateFlags, DispatchFlags;
+			public float Exposure;
+			public uint Direct;
+			public uint MaxRenderW, MaxRenderH;
+		}
+
+		[StructLayout(LayoutKind.Sequential)]
+		internal struct Stats
+		{
+			public ulong Frames, ProviderId;
+			public int LastResult, Failed;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)] public byte[] Provider;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 128)] public byte[] Adapter;
+			public ulong Presented;
+			public float CpuMs, GpuMs;
+			public ulong FsrMemory, LogDropped;
+			public uint BridgeStarts, ContextStarts;
+			public int RemovedReason;
+			public uint Failures;
+			public float GpuPeriodMs, GpuPeriodMin, GpuPeriodMax, GpuBusyMs, GpuBusyMin, GpuBusyMax;
+			public ulong GpuFrames, GpuDisjoint, GpuDropped;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 48)] public float[] MarkMs;
+			public float FlushMs;
+			public uint ExposureWanted;
+			public ulong DirectFrames;
+		}
+
+		internal const uint HighDynamicRange = 1 << 0, DepthInverted = 1 << 3, AutoExposure = 1 << 5, NonLinearColorspace = 1 << 8;
+		internal const uint NonLinearSrgb = 1 << 1;
+
+		[DllImport("kernel32", CharSet = CharSet.Unicode, SetLastError = true)] static extern IntPtr LoadLibraryW(string path);
+		[DllImport(Dll, CharSet = CharSet.Unicode)] static extern int FSR4_Load(string dir);
+		[DllImport(Dll)] internal static extern IntPtr FSR4_GetRenderEventFunc();
+		[DllImport(Dll)] static extern int FSR4_PollLog(byte[] buf, int cap);
+		[DllImport(Dll)] static extern void FSR4_GetStats(out Stats s);
+		[DllImport(Dll)] internal static extern void FSR4_ClearFailure();
+		[DllImport(Dll)] static extern int FSR4_Failed();
+		[DllImport(Dll)] static extern int FSR4_ExposureWanted();
+		[DllImport(Dll)] internal static extern ulong FSR4_GetViews(out IntPtr color, out IntPtr motion, out IntPtr output);
+		[DllImport(Dll)] internal static extern void FSR4_ViewsInUse(ulong gen);
+		internal const uint DirectColor = 1, DirectOutput = 2, DirectMotion = 4;
+		internal static bool ExposureWanted => FSR4_ExposureWanted() != 0;
+
+		internal static bool Failed => FSR4_Failed() != 0;
+
+		internal static bool Ready { get; private set; }
+
+		internal static IntPtr RenderEvent { get; private set; }
+
+		static readonly byte[] _line = new byte[1024];
+
+		internal static bool Load()
+		{
+			try
+			{
+				string dir = Path.Combine(MelonEnvironment.UserDataDirectory, "FSR4");
+				Directory.CreateDirectory(dir);
+				var asm = typeof(Native).Assembly;
+				foreach (var f in Files)
+				{
+					using (var s = asm.GetManifestResourceStream("FSR4.native." + f))
+					{
+						if (s == null) { MelonLogger.Error($"{Mod.Name}: {f} missing from the mod."); return false; }
+						var bytes = new byte[s.Length];
+						for (int read = 0, n; read < bytes.Length; read += n)
+							if ((n = s.Read(bytes, read, bytes.Length - read)) <= 0) throw new EndOfStreamException($"{f}: {read} of {bytes.Length} bytes");
+						string path = Path.Combine(dir, f);
+						if (!SameFile(path, bytes)) Write(path, bytes);
+					}
+				}
+				if (LoadLibraryW(Path.Combine(dir, Files[0])) == IntPtr.Zero) { MelonLogger.Error($"{Mod.Name}: could not load {Files[0]} (error {Marshal.GetLastWin32Error()})."); return false; }
+				bool ok = FSR4_Load(dir) == 1;
+				Poll();
+				if (!ok) return false;
+				RenderEvent = FSR4_GetRenderEventFunc();
+				Ready = true;
+				return true;
+			}
+			catch (Exception e)
+			{
+				MelonLogger.Error($"{Mod.Name}: native part failed to load: {e.Message}");
+				return false;
+			}
+		}
+
+		static void Write(string path, byte[] bytes)
+		{
+			foreach (var old in Directory.GetFiles(Path.GetDirectoryName(path), Path.GetFileName(path) + ".old*"))
+				try { File.Delete(old); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+			try { File.WriteAllBytes(path, bytes); return; }
+			catch (IOException) { }
+			catch (UnauthorizedAccessException) { }
+			File.Move(path, $"{path}.old{DateTime.Now.Ticks}");
+			File.WriteAllBytes(path, bytes);
+		}
+
+		static bool SameFile(string path, byte[] bytes)
+		{
+			if (!File.Exists(path) || new FileInfo(path).Length != bytes.Length) return false;
+			using (var sha = SHA256.Create())
+			using (var f = File.OpenRead(path))
+				return Convert.ToBase64String(sha.ComputeHash(f)) == Convert.ToBase64String(sha.ComputeHash(bytes));
+		}
+
+		internal static void Poll()
+		{
+			int n;
+			while ((n = FSR4_PollLog(_line, _line.Length)) > 0) MelonLogger.Msg(System.Text.Encoding.UTF8.GetString(_line, 0, n));
+		}
+
+		internal static Stats GetStats()
+		{
+			FSR4_GetStats(out var s);
+			return s;
+		}
+	}
+}

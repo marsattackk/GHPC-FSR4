@@ -1,0 +1,46 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net472</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>FSR4</AssemblyName>
+    <RootNamespace>FSR4</RootNamespace>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+    <Deterministic>true</Deterministic>
+    <PathMap>$(MSBuildProjectDirectory)=.</PathMap>
+    <GameDir Condition="'$(GameDir)' == ''">C:\Program Files (x86)\Steam\steamapps\common\Gunner HEAT PC\Bin</GameDir>
+    <NoWarn>$(NoWarn);MSB3277;CS0618</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3" PrivateAssets="all" />
+  </ItemGroup>
+
+  <ItemGroup>
+
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="MelonLoader" HintPath="$(GameDir)\MelonLoader\net35\MelonLoader.dll" Private="false" />
+    <Reference Include="0Harmony" HintPath="$(GameDir)\MelonLoader\net35\0Harmony.dll" Private="false" />
+    <Reference Include="$(GameDir)\GHPC_Data\Managed\*.dll" Exclude="$(GameDir)\GHPC_Data\Managed\mscorlib.dll;$(GameDir)\GHPC_Data\Managed\netstandard.dll;$(GameDir)\GHPC_Data\Managed\System*.dll;$(GameDir)\GHPC_Data\Managed\Mono*.dll">
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Build stamp (BuildStamp.targets, beside this file): AssemblyInformationalVersion "<version>+<commit>.public", logged on
+       load. The commit is the one this source was cleaned from when the release build passes it (-p:GitCommit=...), else "unknown". -->
+  <PropertyGroup>
+    <BuildFlavour Condition="'$(BuildFlavour)' == ''">public</BuildFlavour>
+    <StampAskGit>false</StampAskGit>
+  </PropertyGroup>
+  <Import Project="BuildStamp.targets" Condition="Exists('BuildStamp.targets')" />
+  <!-- A mod with a native half: its build and embedding (Native.targets, beside this file, when the mod has one). -->
+  <Import Project="Native.targets" Condition="Exists('Native.targets')" />
+
+</Project>

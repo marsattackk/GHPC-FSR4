@@ -1,0 +1,118 @@
+name: Bug report
+description: Something in the mod is broken, looks wrong, or the game won't load or crashes with it.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting it. The log is the bit that actually lets me find the cause, so please don't skip it.
+
+        I only test the mod on the current Steam version of GHPC. If you're on a cracked copy or an old build, I can't help with it.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: kind
+    attributes:
+      label: What kind of problem
+      options:
+        - The picture looks wrong (blur, ghosting, shimmer, flicker, something missing)
+        - FSR doesn't start or switches itself off
+        - Worse performance than without the mod
+        - The game hangs or won't load
+        - The game crashes or closes
+        - Something else
+    validations:
+      required: true
+
+  - type: textarea
+    id: where
+    attributes:
+      label: Where and how
+      description: The mission or mode, what view you were in (gunner's sight, commander, outside, map), and what you did right before it happened.
+      placeholder: |
+        Instant Action, gunner's sight, traversing the turret over a treeline and ...
+    validations:
+      required: true
+
+  - type: input
+    id: gpu
+    attributes:
+      label: Graphics card and driver
+      description: Name of the card and the driver version.
+      placeholder: "Radeon RX 9070 XT, Adrenalin 25.10.1"
+    validations:
+      required: true
+
+  - type: input
+    id: setup
+    attributes:
+      label: Resolution and FSR mode
+      description: The game's resolution and the `Quality` setting you had (or the mode the F9 key had you on).
+      placeholder: "3840x2160, Balanced"
+    validations:
+      required: true
+
+  - type: input
+    id: mod_version
+    attributes:
+      label: FSR 4 Upscaling version
+      description: From the zip you installed, or the MelonLoader console when the game starts.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+
+  - type: input
+    id: loader_version
+    attributes:
+      label: MelonLoader version
+      description: First line of the MelonLoader console. The mod needs 0.7.3 or newer.
+      placeholder: "0.7.3"
+
+  - type: dropdown
+    id: alone
+    attributes:
+      label: Does it happen with only this mod installed?
+      description: Move your other mods out of the `Mods` folder for one go. It tells me straight away if it's a clash with another mod.
+      options:
+        - Haven't tried
+        - "Yes, it happens with only this mod"
+        - "No, only with my other mods"
+    validations:
+      required: true
+
+  - type: textarea
+    id: other_mods
+    attributes:
+      label: Other mods and overlays
+      description: The other mods you have installed, plus anything that hooks into the game's rendering (ReShade, OptiScaler, Special K, overlays). Write "none" if there aren't any.
+
+  - type: textarea
+    id: latest_log
+    attributes:
+      label: MelonLoader log
+      description: |
+        Drag `MelonLoader\Latest.log` from the game folder (where `GHPC.exe` is) in here, from a session where it went wrong. It gets overwritten every time the game starts, so grab it before you start the game again, or take the matching dated one from `MelonLoader\Logs`.
+      placeholder: Drop Latest.log here
+    validations:
+      required: true
+
+  - type: textarea
+    id: player_log
+    attributes:
+      label: Unity log (for hangs and crashes)
+      description: |
+        If the game hung or crashed, drag this one in too: `%USERPROFILE%\AppData\LocalLow\Radian Simulations LLC\GHPC\Player.log` (paste that path into the Explorer address bar). It shows where the game itself stopped. If you've started the game again since, send `Player-prev.log` from the same folder instead.
+      placeholder: Drop Player.log here
+
+  - type: textarea
+    id: pictures
+    attributes:
+      label: Screenshots or video
+      description: For anything you can see, a screenshot with the mod and one with `Enabled = false` (or F9 to Off) from the same spot helps a lot.

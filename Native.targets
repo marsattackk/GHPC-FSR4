@@ -1,0 +1,45 @@
+<Project>
+
+  <!-- The native half (native\bridge.cpp) is built with CMake and the Microsoft C++ build tools before the C# build, then
+       embedded in FSR4.dll with AMD's signed FSR DLLs; the mod writes them to UserData\FSR4 in the game folder at start.
+       AMD's DLLs: amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll from the FidelityFX SDK
+       (Kits\FidelityFX\signedbin), in native\amd or the folder given with -p:FsrSdkBin=<folder>. -->
+  <PropertyGroup>
+    <NativeDir>$(MSBuildThisFileDirectory)native</NativeDir>
+    <NativeBuild>$(NativeDir)\build</NativeBuild>
+    <NativeOut>$(NativeBuild)\Release\FSR4Bridge.dll</NativeOut>
+    <FsrSdkBin Condition="'$(FsrSdkBin)' == ''">$(NativeDir)\amd</FsrSdkBin>
+    <VsWhere>$(MSBuildProgramFiles32)\Microsoft Visual Studio\Installer\vswhere.exe</VsWhere>
+    <CMakeFallback>C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe</CMakeFallback>
+  </PropertyGroup>
+  <ItemGroup>
+    <NativeInput Include="$(NativeDir)\bridge.cpp;$(NativeDir)\CMakeLists.txt;$(NativeDir)\ffx\**\*.h;$(NativeDir)\ffx\**\*.hpp" />
+  </ItemGroup>
+
+  <!-- CMake: -p:CMakeExe=<path> when given, else the one Visual Studio's installer reports, else the Build Tools 2022 path. -->
+  <Target Name="FindCMake" BeforeTargets="BuildNative" Condition="'$(CMakeExe)' == ''">
+    <Exec Condition="Exists('$(VsWhere)')" Command="&quot;$(VsWhere)&quot; -latest -products * -requires Microsoft.VisualStudio.Component.VC.CMake.Project -find Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe" ConsoleToMSBuild="true" StandardOutputImportance="low" IgnoreExitCode="true">
+      <Output TaskParameter="ConsoleOutput" PropertyName="CMakeFound" />
+    </Exec>
+    <PropertyGroup>
+      <CMakeExe Condition="'$(CMakeFound)' != '' And Exists('$(CMakeFound)')">$(CMakeFound)</CMakeExe>
+      <CMakeExe Condition="'$(CMakeExe)' == ''">$(CMakeFallback)</CMakeExe>
+    </PropertyGroup>
+  </Target>
+  <Target Name="BuildNative" BeforeTargets="BeforeBuild" Inputs="@(NativeInput)" Outputs="$(NativeOut)">
+    <Exec Condition="!Exists('$(NativeBuild)\FSR4Bridge.sln')" Command="&quot;$(CMakeExe)&quot; -S &quot;$(NativeDir)&quot; -B &quot;$(NativeBuild)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64 -DFSR4_PUBLIC=ON" />
+    <Exec Command="&quot;$(CMakeExe)&quot; --build &quot;$(NativeBuild)&quot; --config Release" />
+  </Target>
+  <Target Name="CheckFsrSdk" BeforeTargets="BeforeBuild" Condition="'$(NativeOnlyBridge)' != 'true'">
+    <Error Condition="!Exists('$(FsrSdkBin)\amd_fidelityfx_upscaler_dx12.dll')" Text="AMD's FSR DLLs not found in $(FsrSdkBin): copy amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll from the FidelityFX SDK (Kits\FidelityFX\signedbin) there, or pass -p:FsrSdkBin=(that folder)." />
+  </Target>
+
+  <ItemGroup>
+    <EmbeddedResource Include="$(NativeOut)" LogicalName="FSR4.native.FSR4Bridge.dll" />
+  </ItemGroup>
+  <ItemGroup Condition="'$(NativeOnlyBridge)' != 'true'">
+    <EmbeddedResource Include="$(FsrSdkBin)\amd_fidelityfx_loader_dx12.dll" LogicalName="FSR4.native.amd_fidelityfx_loader_dx12.dll" />
+    <EmbeddedResource Include="$(FsrSdkBin)\amd_fidelityfx_upscaler_dx12.dll" LogicalName="FSR4.native.amd_fidelityfx_upscaler_dx12.dll" />
+  </ItemGroup>
+
+</Project>
