@@ -29,16 +29,17 @@ To remove it, delete `Mods\FSR4.dll` and the `UserData\FSR4` folder.
 
 Press **F9** in game to step through them, or set one in the settings.
 
-| Mode | At 4K renders at |
-|---|---|
-| NativeAA | 3840x2160, FSR as anti-aliasing only |
-| Quality (default) | 2560x1440 |
-| Balanced | about 2260x1270 |
-| Performance | 1920x1080 |
-| UltraPerformance | 1280x720 |
-| Auto | whatever holds your target frame rate (90 by default) |
+| Mode | At 1080p renders at | At 4K renders at |
+|---|---|---|
+| NativeAA (FSR as anti-aliasing only) | 1920x1080 | 3840x2160 |
+| Quality (default) | 1280x720 | 2560x1440 |
+| Balanced | about 1130x635 | about 2260x1270 |
+| Performance | 960x540 | 1920x1080 |
+| UltraPerformance | 640x360 | 1280x720 |
+| Auto | 1920x1080 to 960x540 | 3840x2160 to 1920x1080 |
 
-Auto only drops the resolution when the graphics card is actually what's holding you back.
+Auto moves the resolution to hold your target frame rate (90 by default), and only drops it when the graphics card is
+actually what's holding you back.
 
 The mod also switches off a few of the game's cameras that render every frame for nothing (first-person, map,
 heat haze). Same picture, about 1 ms a frame back at 4K, and it works with FSR off too.
