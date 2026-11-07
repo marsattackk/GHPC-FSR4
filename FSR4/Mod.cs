@@ -3,7 +3,7 @@ using FSR4.Common;
 using MelonLoader;
 using UnityEngine;
 
-[assembly: MelonInfo(typeof(FSR4.Mod), "FSR 4 Upscaling", "0.2.0", "marsattackk")]
+[assembly: MelonInfo(typeof(FSR4.Mod), "FSR 4 Upscaling", "0.3.0", "marsattackk")]
 [assembly: MelonGame("Radian Simulations LLC", "GHPC")]
 [assembly: HarmonyDontPatchAll]
 
@@ -15,6 +15,7 @@ namespace FSR4
 		internal static MelonPreferences_Entry<bool> Enabled;
 		internal static MelonPreferences_Entry<string> Quality;
 		internal static MelonPreferences_Entry<float> Sharpness;
+		internal static MelonPreferences_Entry<bool> FrameGeneration;
 
 		static readonly string[] Modes = { "NativeAA", "Quality", "Balanced", "Performance", "UltraPerformance" };
 		static readonly float[] Ratios = { 1f, 1.5f, 1.7f, 2f, 3f };
@@ -38,6 +39,7 @@ namespace FSR4
 			Enabled = cfg.CreateEntry("Enabled", true, description: "Upscale the game with AMD FSR 4.1 (FSR 3.1 on GPUs without FSR 4).");
 			Quality = cfg.CreateEntry("Quality", "Quality", description: "NativeAA (1x, anti-aliasing only), Quality (1.5x), Balanced (1.7x), Performance (2x), UltraPerformance (3x), or Auto (the scale follows 'Target frame rate', between 'Auto minimum scale' and 'Auto maximum scale').");
 			Sharpness = cfg.CreateEntry("Sharpness", 0.2f, description: "Extra sharpening, 0 (none) to 1.");
+			FrameGeneration = cfg.CreateEntry("FrameGeneration", false, description: "AMD frame generation: one generated frame between every two rendered ones (needs FSR on, any mode). Off by default.");
 			AutoScale.Init(cfg);
 			CycleKey = cfg.CreateEntry("Cycle key", "F9", description: "Key that steps through the modes while playing: NativeAA, Quality, Balanced, Performance, UltraPerformance, Auto, Off (a Unity KeyCode name; None for no key).");
 			_cycleVk = VirtualKey(CycleKey.Value);
@@ -45,7 +47,7 @@ namespace FSR4
 			PerfSettings.Init(HarmonyInstance);
 			if (!Native.Load()) { MelonLogger.Warning($"{Name}: the upscaler could not start (above); the game runs as without the mod."); return; }
 			TaaSlot.Patch(HarmonyInstance);
-			MelonLogger.Msg(Enabled.Value ? $"{Name} loaded: {Quality.Value}, sharpness {Sharpness.Value:0.##}." : $"{Name} loaded, disabled in its settings.");
+			MelonLogger.Msg(Enabled.Value ? $"{Name} loaded: {Quality.Value}, sharpness {Sharpness.Value:0.##}{(FrameGeneration.Value ? ", frame generation on" : "")}." : $"{Name} loaded, disabled in its settings.");
 		}
 
 		public override void OnUpdate()

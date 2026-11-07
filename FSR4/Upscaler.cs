@@ -42,7 +42,23 @@ namespace FSR4
 			_cam = GetComponent<Camera>();
 			_pp = GetComponent<PostProcessLayer>();
 			for (int i = 0; i < _frames.Length; i++) _frames[i] = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(Native.FrameData)));
+			_fd.CamPos = new float[3]; _fd.CamUp = new float[3]; _fd.CamRight = new float[3]; _fd.CamFwd = new float[3];
 			Current = this;
+		}
+
+		static bool _hookAsked;
+		static bool FgWanted => Mod.FrameGeneration.Value
+			;
+		static bool HudlessWanted => FgWanted
+			;
+
+		void EnsureHook()
+		{
+			if (_hookAsked || !FgWanted || _colorPtr == IntPtr.Zero) return;
+			_hookAsked = true;
+			Native.FSR4_HookPresent(_colorPtr);
+			GL.IssuePluginEvent(Native.RenderEvent, 6);
+			MelonLogger.Msg($"{Mod.Name}: frame generation asked for: the game's present is being hooked.");
 		}
 
 		void OnDestroy()
@@ -76,6 +92,7 @@ namespace FSR4
 			if (!Running || dw != DisplayW || dh != DisplayH || aw != AllocW || ah != AllocH || dyn != _dynamic) Begin(dw, dh, aw, ah, rw, rh, ratio, dyn);
 			if (rw != RenderW || rh != RenderH) SetRenderSize(rw, rh);
 			BindViews();
+			EnsureHook();
 			MipBias.Tick(MipRenderW(), DisplayW);
 			HistoryResets.Tick();
 		}
@@ -126,6 +143,7 @@ namespace FSR4
 			{
 				_final = new RenderTexture(dw, dh, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB) { name = "FSR4 final", useMipMap = false, antiAliasing = 1 };
 				_final.Create();
+				_final.GetNativeTexturePtr();
 				bool hdr = _cam.allowHDR;
 				var format = hdr ? RenderTextureFormat.ARGBHalf : RenderTextureFormat.ARGB32;
 				_displayTarget = new RenderTexture(dw, dh, 0, format, format == RenderTextureFormat.ARGB32 ? RenderTextureReadWrite.sRGB : RenderTextureReadWrite.Linear) { name = "FSR4 display target", useMipMap = false, antiAliasing = 1 };
@@ -177,10 +195,46 @@ namespace FSR4
 				}
 			}
 			Native.FSR4_ViewsInUse(_extGen);
+			BindHudless();
+		}
+
+		Texture2D _extHudless;
+		CommandBuffer _hudlessCmd;
+		RenderTexture _hudRt;
+		internal bool HudlessBound => _extHudless != null && _presenter != null;
+
+		void BindHudless()
+		{
+			ulong gen = Native.FSR4_GetHudlessView(out IntPtr hp);
+			if (gen == _staleGen) gen = 0;
+			bool want = gen != 0 && HudlessWanted && _presenter != null;
+			if (_extHudless != null && (!want || gen != _extGen)) DropHudless();
+			if (want && _extHudless == null)
+			{
+				_extHudless = Texture2D.CreateExternalTexture(DisplayW, DisplayH, TextureFormat.RGBA32, false, false, hp);
+				_hudRt = new RenderTexture(DisplayW, DisplayH, 0, RenderTextureFormat.ARGB32, RenderTextureReadWrite.sRGB) { name = "FSR4 hudless", useMipMap = false, antiAliasing = 1 };
+				_hudRt.Create();
+				_hudlessCmd = new CommandBuffer { name = "FSR4 hudless" };
+				_hudlessCmd.Blit(BuiltinRenderTextureType.CameraTarget, _hudRt);
+				_hudlessCmd.CopyTexture(_hudRt, _extHudless);
+				_presenter.AddCommandBuffer(CameraEvent.AfterEverything, _hudlessCmd);
+			}
+		}
+
+		void DropHudless()
+		{
+			if (_hudlessCmd != null && _presenter != null) _presenter.RemoveCommandBuffer(CameraEvent.AfterEverything, _hudlessCmd);
+			_hudlessCmd?.Release();
+			_hudlessCmd = null;
+			if (_hudRt != null) { _hudRt.Release(); Destroy(_hudRt); }
+			_hudRt = null;
+			if (_extHudless != null) Destroy(_extHudless);
+			_extHudless = null;
 		}
 
 		void DropViews()
 		{
+			DropHudless();
 			foreach (var t in new[] { _extColor, _extMotion, _extOutput }) if (t != null) Destroy(t);
 			_extColor = _extMotion = _extOutput = null;
 			_extGen = 0;
@@ -292,6 +346,7 @@ namespace FSR4
 			else if (part) cmd.BlitFullscreenTriangle(BuiltinRenderTextureType.MotionVectors, _motion, false, vp);
 			else cmd.Blit(BuiltinRenderTextureType.MotionVectors, _motion);
 			if (views) direct |= Native.DirectOutput;
+			if (HudlessBound && _fd.Fg != 0) direct |= Native.DirectHudless;
 			Marshal.WriteInt32(_slotFrame, DirectOffset, (int)direct);
 			cmd.IssuePluginEventAndData(Native.RenderEvent, 1, _slotFrame);
 			cmd.BlitFullscreenTriangle(views ? (RenderTargetIdentifier)_extOutput : _output, context.destination);
@@ -350,6 +405,14 @@ namespace FSR4
 			_fd.DispatchFlags = gamma ? Native.NonLinearSrgb : 0;
 			_fd.Exposure = Native.ExposureWanted ? GameExposure.Value(_pp) : 0f;
 			_fd.Direct = 0;
+			_fd.Fg = FgWanted && _hookAsked ? 1u : 0u;
+			_fd.Hudless = HudlessWanted && _presenter != null ? (IntPtr)1 : IntPtr.Zero;
+			var tr = transform;
+			Vector3 p3 = tr.position, up = tr.up, right = tr.right, fwd = tr.forward;
+			_fd.CamPos[0] = p3.x; _fd.CamPos[1] = p3.y; _fd.CamPos[2] = p3.z;
+			_fd.CamUp[0] = up.x; _fd.CamUp[1] = up.y; _fd.CamUp[2] = up.z;
+			_fd.CamRight[0] = right.x; _fd.CamRight[1] = right.y; _fd.CamRight[2] = right.z;
+			_fd.CamFwd[0] = fwd.x; _fd.CamFwd[1] = fwd.y; _fd.CamFwd[2] = fwd.z;
 			IntPtr slot = _frames[_frame++ % _frames.Length];
 			Marshal.StructureToPtr(_fd, slot, false);
 			_reset = false;

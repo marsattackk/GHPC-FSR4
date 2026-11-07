@@ -11,7 +11,7 @@ namespace FSR4
 	internal static class Native
 	{
 		const string Dll = "FSR4Bridge";
-		static readonly string[] Files = { "FSR4Bridge.dll", "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll" };
+		static readonly string[] Files = { "FSR4Bridge.dll", "amd_fidelityfx_loader_dx12.dll", "amd_fidelityfx_upscaler_dx12.dll", "amd_fidelityfx_framegeneration_dx12.dll" };
 
 		[StructLayout(LayoutKind.Sequential)]
 		internal struct FrameData
@@ -26,6 +26,12 @@ namespace FSR4
 			public float Exposure;
 			public uint Direct;
 			public uint MaxRenderW, MaxRenderH;
+			public IntPtr Hudless;
+			public uint Fg;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)] public float[] CamPos;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)] public float[] CamUp;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)] public float[] CamRight;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 3)] public float[] CamFwd;
 		}
 
 		[StructLayout(LayoutKind.Sequential)]
@@ -48,6 +54,15 @@ namespace FSR4
 			public float FlushMs;
 			public uint ExposureWanted;
 			public ulong DirectFrames;
+			[MarshalAs(UnmanagedType.ByValArray, SizeConst = 64)] public byte[] FgProvider;
+			public ulong FgProviderId, FgPrepared, FgGenerated, FgReal, FgSkipped, FgMemory;
+			public int FgLastResult;
+			public float FgGpuMs, FgPaceMs, FgIntervalMs;
+			public float FgHookMs;
+			public float FgRefreshHz;
+			public ulong FgNotNeeded;
+			public ulong PresentsHooked;
+			public ulong FgHudless;
 		}
 
 		internal const uint HighDynamicRange = 1 << 0, DepthInverted = 1 << 3, AutoExposure = 1 << 5, NonLinearColorspace = 1 << 8;
@@ -64,7 +79,9 @@ namespace FSR4
 		[DllImport(Dll)] internal static extern ulong FSR4_GetViews(out IntPtr color, out IntPtr motion, out IntPtr output);
 		[DllImport(Dll)] internal static extern void FSR4_ViewsInUse(ulong gen);
 		[DllImport(Dll)] static extern int FSR4_LayoutField(int which, int i, out IntPtr name, out uint offset);
-		internal const uint DirectColor = 1, DirectOutput = 2, DirectMotion = 4;
+		internal const uint DirectColor = 1, DirectOutput = 2, DirectMotion = 4, DirectHudless = 8;
+		[DllImport(Dll)] internal static extern ulong FSR4_GetHudlessView(out IntPtr hudless);
+		[DllImport(Dll)] internal static extern void FSR4_HookPresent(IntPtr texture);
 		internal static bool ExposureWanted => FSR4_ExposureWanted() != 0;
 
 		internal static bool Failed => FSR4_Failed() != 0;

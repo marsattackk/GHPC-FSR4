@@ -13,7 +13,7 @@
     <CMakeFallback>C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe</CMakeFallback>
   </PropertyGroup>
   <ItemGroup>
-    <NativeInput Include="$(NativeDir)\bridge.cpp;$(NativeDir)\CMakeLists.txt;$(NativeDir)\ffx\**\*.h;$(NativeDir)\ffx\**\*.hpp" />
+    <NativeInput Include="$(NativeDir)\*.cpp;$(NativeDir)\*.h;$(NativeDir)\CMakeLists.txt;$(NativeDir)\ffx\**\*.h;$(NativeDir)\ffx\**\*.hpp" />
   </ItemGroup>
 
   <!-- CMake: -p:CMakeExe=<path> when given, else the one Visual Studio's installer reports, else the Build Tools 2022 path. -->
@@ -31,7 +31,7 @@
     <Exec Command="&quot;$(CMakeExe)&quot; --build &quot;$(NativeBuild)&quot; --config Release" />
   </Target>
   <Target Name="CheckFsrSdk" BeforeTargets="BeforeBuild" Condition="'$(NativeOnlyBridge)' != 'true'">
-    <Error Condition="!Exists('$(FsrSdkBin)\amd_fidelityfx_upscaler_dx12.dll')" Text="AMD's FSR DLLs not found in $(FsrSdkBin): copy amd_fidelityfx_loader_dx12.dll and amd_fidelityfx_upscaler_dx12.dll from the FidelityFX SDK (Kits\FidelityFX\signedbin) there, or pass -p:FsrSdkBin=(that folder)." />
+    <Error Condition="!Exists('$(FsrSdkBin)\amd_fidelityfx_upscaler_dx12.dll') Or !Exists('$(FsrSdkBin)\amd_fidelityfx_framegeneration_dx12.dll')" Text="AMD's FSR DLLs not found in $(FsrSdkBin): copy amd_fidelityfx_loader_dx12.dll, amd_fidelityfx_upscaler_dx12.dll and amd_fidelityfx_framegeneration_dx12.dll from the FidelityFX SDK (Kits\FidelityFX\signedbin) there, or pass -p:FsrSdkBin=(that folder)." />
   </Target>
 
   <ItemGroup>
@@ -40,6 +40,7 @@
   <ItemGroup Condition="'$(NativeOnlyBridge)' != 'true'">
     <EmbeddedResource Include="$(FsrSdkBin)\amd_fidelityfx_loader_dx12.dll" LogicalName="FSR4.native.amd_fidelityfx_loader_dx12.dll" />
     <EmbeddedResource Include="$(FsrSdkBin)\amd_fidelityfx_upscaler_dx12.dll" LogicalName="FSR4.native.amd_fidelityfx_upscaler_dx12.dll" />
+    <EmbeddedResource Include="$(FsrSdkBin)\amd_fidelityfx_framegeneration_dx12.dll" LogicalName="FSR4.native.amd_fidelityfx_framegeneration_dx12.dll" />
   </ItemGroup>
 
 </Project>

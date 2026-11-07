@@ -47,10 +47,22 @@ heat haze). Same picture, about 1 ms a frame back at 4K, and it works with FSR o
 
 If FSR can't start, the mod says so in the MelonLoader console and the game carries on with its own anti-aliasing.
 
+## Frame generation
+
+Off by default. Set `FrameGeneration = true` in the settings and AMD's frame generation puts a generated frame between
+every two real ones, so 80 real frames come out as about 160 on screen. It needs FSR on, any mode. On a Radeon RX 9000
+it's FSR 4 frame generation, anything else gets FSR 3.1's.
+
+- It costs a bit: about 7 % of your real frames on my PC, so expect a touch more input lag than the frame counter suggests.
+- It only steps in when the game runs below half your monitor's refresh rate, above that there's nothing to gain.
+- I run it with the game's vsync off and its frame cap at 90. That's the setup I've tested.
+- The HUD stays sharp, but trees right next to the camera can smear a bit when you swing the view fast. That's the
+  generated frame guessing, not much I can do about it.
+
 ## Known limits
 
-- The FSR 3.1 path has only been tested by forcing it on an FSR 4 card. If you're on something else, I'd like to hear
-  how it goes.
+- The FSR 3.1 path has only been tested by forcing it on an FSR 4 card, and FSR 3.1 frame generation hasn't been run at
+  all. If you're on something else, I'd like to hear how it goes.
 - Trees are the most expensive thing in the sights and there's no free fix for them. Fewer pixels is what helps, which
   is what the modes are for.
 
@@ -74,6 +86,7 @@ After the first start, `UserData\MelonPreferences.cfg` has an `[FSR 4]` section 
 | `Auto maximum scale` | Auto only, 2.0 is Performance | 2.0 |
 | `Cycle key` | F1-F15, A-Z, 0-9 or None | F9 |
 | `Show mode on screen` | true / false | true |
+| `FrameGeneration` | true / false | false |
 
 The camera switches are in `[FSR4_Performance]`: `FpCameraIdle`, `FpCameraNoShadows`, `DistortionCameraForward` and
 `MapCameraIdle` (on), `InstancerCameraFilter` (off, no measurable gain).
@@ -84,7 +97,7 @@ The camera switches are in `[FSR4_Performance]`: `FpCameraIdle`, `FpCameraNoShad
 <summary><b>How it works (for devs)</b></summary>
 
 Two halves: the C# mod hooks into Unity and GHPC, and a C++ bridge (`native\bridge.cpp`) runs FSR. The bridge and
-AMD's two DLLs are embedded in `FSR4.dll` and unpacked to `UserData\FSR4` at start.
+AMD's three DLLs are embedded in `FSR4.dll` and unpacked to `UserData\FSR4` at start.
 
 **Where FSR sits in the frame.** GHPC uses Unity's Post Processing Stack v2. While FSR is on, I force the main camera's
 `PostProcessLayer` to TAA and a Harmony transpiler on `PostProcessLayer.Render` swaps its two TAA calls (the jittered
@@ -115,6 +128,10 @@ upscaler versions the driver offers and takes FSR 4 when it's there, FSR 3.1 whe
 - Guards: the transpiler checks the patched IL, and if a game update moves the code it hooks, or nothing gets upscaled,
   FSR switches off for the session. If the bridge hits an error, FSR stops and the game falls back to its own
   anti-aliasing.
+- Frame generation: the bridge hooks the game's `Present` through its swap chain and runs AMD's frame generation by hand
+  on its D3D12 device, then presents the generated frame and the real one through the game's own chain, paced to half
+  the real interval. AMD's own frame generation swap chain is out, cos DXGI won't take a second flip chain on Unity's
+  window. It gets the frame before the overlay UI as its hudless input, which is what keeps the compass tape from doubling.
 
 </details>
 
@@ -122,8 +139,8 @@ upscaler versions the driver offers and takes FSR 4 when it's there, FSR 3.1 whe
 <summary><b>Building from source</b></summary>
 
 C# (.NET Framework 4.7.2) plus a C++ half in `native\`. You need the .NET SDK 6+, GHPC with MelonLoader, CMake and the
-Visual Studio 2022 C++ build tools, and AMD's `amd_fidelityfx_loader_dx12.dll` and `amd_fidelityfx_upscaler_dx12.dll`
-from the [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) (`Kits\FidelityFX\signedbin`) in
+Visual Studio 2022 C++ build tools, and AMD's `amd_fidelityfx_loader_dx12.dll`, `amd_fidelityfx_upscaler_dx12.dll` and
+`amd_fidelityfx_framegeneration_dx12.dll` from the [FidelityFX SDK](https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK) (`Kits\FidelityFX\signedbin`) in
 `native\amd\` (or `-p:FsrSdkBin=<folder>`).
 
 ```

@@ -19,10 +19,17 @@
 #include "ffx_api_loader.h"
 #include "dx12/ffx_api_dx12.h"
 #include "ffx_upscale.h"
+#include "ffx_framegeneration.h"
+#include <timeapi.h>
 
 using Microsoft::WRL::ComPtr;
 
 #define EXPORT extern "C" __declspec(dllexport)
+
+void PresentEvent(int eventId);
+bool PresentHooked();
+uint64_t PresentsSeen();
+typedef HRESULT(STDMETHODCALLTYPE* PresentFn)(IDXGISwapChain*, UINT, UINT);
 
 struct FrameData
 {
@@ -39,6 +46,9 @@ struct FrameData
 	float exposure;
 	uint32_t direct;
 	uint32_t maxRenderW, maxRenderH;
+	void* hudless;
+	uint32_t fg;
+	float camPos[3], camUp[3], camRight[3], camFwd[3];
 };
 
 struct Stats
@@ -68,11 +78,20 @@ struct Stats
 	float flushMs;
 	uint32_t exposureWanted;
 	uint64_t directFrames;
+	char fgProvider[64];
+	uint64_t fgProviderId, fgPrepared, fgGenerated, fgReal, fgSkipped, fgMemory;
+	int32_t fgLastResult;
+	float fgGpuMs, fgPaceMs, fgIntervalMs;
+	float fgHookMs;
+	float fgRefreshHz;
+	uint64_t fgNotNeeded;
+	uint64_t presentsHooked;
+	uint64_t fgHudless;
 };
 
 static_assert(sizeof(void*) == 8, "64-bit only");
-static_assert(sizeof(FrameData) == 112, "FrameData changed: update Native.cs, kFrameFields and this size");
-static_assert(sizeof(Stats) == 520, "Stats changed: update Native.cs, kStatsFields and this size");
+static_assert(sizeof(FrameData) == 176, "FrameData changed: update Native.cs, kFrameFields and this size");
+static_assert(sizeof(Stats) == 680, "Stats changed: update Native.cs, kStatsFields and this size");
 
 struct LayoutField { const char* name; uint32_t offset; };
 #define LF(T, f) { #f, (uint32_t)offsetof(T, f) }
@@ -83,6 +102,7 @@ static const LayoutField kFrameFields[] = {
 	LF(FrameData, frameTimeMs), LF(FrameData, cameraNear), LF(FrameData, cameraFar), LF(FrameData, fovV),
 	LF(FrameData, sharpness), LF(FrameData, reset), LF(FrameData, createFlags), LF(FrameData, dispatchFlags),
 	LF(FrameData, exposure), LF(FrameData, direct), LF(FrameData, maxRenderW), LF(FrameData, maxRenderH),
+	LF(FrameData, hudless), LF(FrameData, fg), LF(FrameData, camPos), LF(FrameData, camUp), LF(FrameData, camRight), LF(FrameData, camFwd),
 };
 static const LayoutField kStatsFields[] = {
 	LF(Stats, frames), LF(Stats, providerId), LF(Stats, lastResult), LF(Stats, failed), LF(Stats, provider),
@@ -91,6 +111,9 @@ static const LayoutField kStatsFields[] = {
 	LF(Stats, gpuPeriodMs), LF(Stats, gpuPeriodMin), LF(Stats, gpuPeriodMax), LF(Stats, gpuBusyMs), LF(Stats, gpuBusyMin),
 	LF(Stats, gpuBusyMax), LF(Stats, gpuFrames), LF(Stats, gpuDisjoint), LF(Stats, gpuDropped), LF(Stats, markMs),
 	LF(Stats, flushMs), LF(Stats, exposureWanted), LF(Stats, directFrames),
+	LF(Stats, fgProvider), LF(Stats, fgProviderId), LF(Stats, fgPrepared), LF(Stats, fgGenerated), LF(Stats, fgReal), LF(Stats, fgSkipped),
+	LF(Stats, fgMemory), LF(Stats, fgLastResult), LF(Stats, fgGpuMs), LF(Stats, fgPaceMs), LF(Stats, fgIntervalMs),
+	LF(Stats, fgHookMs), LF(Stats, fgRefreshHz), LF(Stats, fgNotNeeded), LF(Stats, presentsHooked), LF(Stats, fgHudless),
 };
 #undef LF
 
@@ -160,12 +183,12 @@ namespace
 		}
 	};
 
-	const int Slots = 3;
+	const int Slots = 6;
 	const DWORD FrameWaitMs = 2000, IdleWaitMs = 5000;
 
 	struct State
 	{
-		HMODULE upscalerDll = nullptr, loaderDll = nullptr;
+		HMODULE upscalerDll = nullptr, loaderDll = nullptr, fgDll = nullptr;
 		ffxFunctions fx = {};
 		bool loaded = false;
 		std::atomic<bool> failed{ false };
@@ -181,6 +204,7 @@ namespace
 		ComPtr<ID3D12GraphicsCommandList> list[Slots];
 		uint64_t allocFence[Slots] = {};
 		bool slotTimed[Slots] = {};
+		bool slotFg[Slots] = {};
 		ComPtr<ID3D11Fence> in11;
 		ComPtr<ID3D12Fence> in12;
 		ComPtr<ID3D12Fence> out12;
@@ -206,6 +230,30 @@ namespace
 		uint32_t ctxDisplayW = 0, ctxDisplayH = 0, ctxRenderW = 0, ctxRenderH = 0, ctxFlags = 0;
 		int errors = 0;
 		Stats stats = {};
+
+		ffxContext fg = nullptr;
+		uint32_t fgDisplayW = 0, fgDisplayH = 0, fgRenderW = 0, fgRenderH = 0, fgFlags = 0;
+		bool fgProvidersListed = false;
+		Shared present, gen, hudless;
+		bool fgPendingHud = false;
+		ComPtr<ID3D12Resource> hudUp;
+		UINT hudUpW = 0, hudUpH = 0;
+		D3D12_RESOURCE_STATES hudUpState = D3D12_RESOURCE_STATE_COPY_DEST;
+		ComPtr<ID3D12RootSignature> flipRs;
+		ComPtr<ID3D12PipelineState> flipPso;
+		ComPtr<ID3D12DescriptorHeap> flipHeap;
+		UINT flipInc = 0;
+		bool flipTried = false, flipOk = false;
+		uint64_t flipDispatches = 0, flipRowCopies = 0;
+		uint64_t fgFrameId = 0;
+		bool fgPending = false;
+		bool fgPendingReset = false;
+		bool fgHavePrevious = false;
+		int fgErrors = 0;
+		LONGLONG fgLastEntry = 0;
+		uint64_t fgRefreshFrames = 0;
+		double fgIntervalTicks = 0;
+		bool fgOffLogged = true;
 	} g;
 
 	std::mutex g_statsLock;
@@ -214,6 +262,7 @@ namespace
 	void Publish()
 	{
 		std::lock_guard<std::mutex> l(g_statsLock);
+		g.stats.presentsHooked = PresentsSeen();
 		g_published = g.stats;
 	}
 
@@ -303,10 +352,35 @@ namespace
 		g.depth.Release();
 		g.motion.Release();
 		g.output.Release();
+		g.present.Release();
+		g.gen.Release();
+		g.hudless.Release();
+	}
+
+	void DestroyFg()
+	{
+		if (g.fg && g.fx.DestroyContext)
+		{
+			ffxConfigureDescFrameGeneration c = {};
+			c.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+			c.frameGenerationEnabled = false;
+			c.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+			c.frameID = g.fgFrameId;
+			g.fx.Configure(&g.fg, &c.header);
+			g.fx.DestroyContext(&g.fg, nullptr);
+			Log("FG context destroyed (%llu frames prepared, %llu generated frames shown; hudless flipped by the dispatch %llu times, by row copies %llu).", (unsigned long long)g.stats.fgPrepared, (unsigned long long)g.stats.fgGenerated, (unsigned long long)g.flipDispatches, (unsigned long long)g.flipRowCopies);
+		}
+		g.fg = nullptr;
+		g.fgDisplayW = g.fgDisplayH = g.fgRenderW = g.fgRenderH = g.fgFlags = 0;
+		g.fgPending = g.fgHavePrevious = false;
+		g.stats.fgProviderId = 0;
+		g.stats.fgProvider[0] = 0;
+		g.stats.fgMemory = 0;
 	}
 
 	void DestroyContext()
 	{
+		DestroyFg();
 		if (g.fsr && g.fx.DestroyContext) g.fx.DestroyContext(&g.fsr, nullptr);
 		g.fsr = nullptr;
 		g.ctxDisplayW = g.ctxDisplayH = g.ctxRenderW = g.ctxRenderH = g.ctxFlags = 0;
@@ -327,6 +401,9 @@ namespace
 			g.readback.Reset();
 			g.expTex.Reset();
 			g.expUpload.Reset();
+			g.hudUp.Reset();
+			g.flipPso.Reset(); g.flipRs.Reset(); g.flipHeap.Reset();
+			g.flipTried = g.flipOk = false;
 			g.in12.Reset();
 			g.out12.Reset();
 			g.queue.Reset();
@@ -335,16 +412,24 @@ namespace
 		else
 		{
 			g.fsr = nullptr;
+			g.fg = nullptr;
+			g.fgDisplayW = g.fgDisplayH = g.fgRenderW = g.fgRenderH = g.fgFlags = 0;
+			g.fgPending = g.fgHavePrevious = false;
 			g.ctxDisplayW = g.ctxDisplayH = g.ctxRenderW = g.ctxRenderH = g.ctxFlags = 0;
 			g.stats.providerId = 0;
 			g.stats.provider[0] = 0;
 			g.stats.fsrMemory = 0;
-			for (Shared* s : { &g.color, &g.depth, &g.motion, &g.output }) { s->t12.Detach(); s->Release(); }
+			g.stats.fgProviderId = 0;
+			g.stats.fgProvider[0] = 0;
+			for (Shared* s : { &g.color, &g.depth, &g.motion, &g.output, &g.present, &g.gen, &g.hudless }) { s->t12.Detach(); s->Release(); }
 			for (int i = 0; i < Slots; i++) { g.list[i].Detach(); g.alloc[i].Detach(); }
 			g.timestamps.Detach();
 			g.readback.Detach();
 			g.expTex.Detach();
 			g.expUpload.Detach();
+			g.hudUp.Detach();
+			g.flipPso.Detach(); g.flipRs.Detach(); g.flipHeap.Detach();
+			g.flipTried = g.flipOk = false;
 			g.in12.Detach();
 			g.out12.Detach();
 			g.queue.Detach();
@@ -433,6 +518,8 @@ namespace
 		return true;
 	}
 
+	bool MakeShared(Shared& s, UINT w, UINT hgt, DXGI_FORMAT fmt, bool uav, const char* name, bool view, int srcFormat);
+
 	bool EnsureShared(Shared& s, ID3D11Texture2D* src, bool uav, const char* name, bool view)
 	{
 		D3D11_TEXTURE2D_DESC sd;
@@ -442,12 +529,17 @@ namespace
 		if (sd.SampleDesc.Count != 1) { Log("%s: multisampled textures are not supported.", name); return false; }
 		if (sd.MipLevels != 1 || sd.ArraySize != 1) { Log("%s: %u mips, %u slices: CopyResource needs exactly one of each.", name, sd.MipLevels, sd.ArraySize); return false; }
 		if (Typeless(fmt)) { Log("%s: no typed format for game texture format %d.", name, (int)sd.Format); return false; }
+		return MakeShared(s, sd.Width, sd.Height, fmt, uav, name, view, (int)sd.Format);
+	}
 
+	bool MakeShared(Shared& s, UINT w, UINT hgt, DXGI_FORMAT fmt, bool uav, const char* name, bool view, int srcFormat)
+	{
+		if (s.t11 && s.w == w && s.h == hgt && s.fmt == fmt) return true;
 		if (!WaitIdle("new shared texture")) return false;
 		s.Release();
 		D3D11_TEXTURE2D_DESC d = {};
-		d.Width = sd.Width;
-		d.Height = sd.Height;
+		d.Width = w;
+		d.Height = hgt;
 		d.MipLevels = 1;
 		d.ArraySize = 1;
 		d.Format = fmt;
@@ -464,8 +556,8 @@ namespace
 		HRESULT hr = g.d12->OpenSharedHandle(h, IID_PPV_ARGS(&s.t12));
 		CloseHandle(h);
 		if (!Check(hr, "texture OpenSharedHandle")) { s.Release(); return false; }
-		s.w = sd.Width;
-		s.h = sd.Height;
+		s.w = w;
+		s.h = hgt;
 		s.fmt = fmt;
 		made = true;
 		if (view)
@@ -476,7 +568,7 @@ namespace
 			s.srv = srv;
 			g_viewGen++;
 		}
-		Log("Shared %s %ux%u, format %d (game texture format %d)%s.", name, s.w, s.h, (int)fmt, (int)sd.Format, view ? ", viewed by Unity" : "");
+		Log("Shared %s %ux%u, format %d (game texture format %d)%s.", name, s.w, s.h, (int)fmt, srcFormat, view ? ", viewed by Unity" : "");
 		return true;
 	}
 
@@ -608,6 +700,59 @@ namespace
 		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 	}
 
+	typedef HRESULT(WINAPI* D3DCompileFn)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, ID3DBlob**, ID3DBlob**);
+	static const char kFlipHlsl[] =
+		"Texture2D<float4> src : register(t0);\n"
+		"RWTexture2D<float4> dst : register(u0);\n"
+		"[numthreads(8, 8, 1)]\n"
+		"void main(uint3 id : SV_DispatchThreadID)\n"
+		"{\n"
+		"	uint w, h;\n"
+		"	dst.GetDimensions(w, h);\n"
+		"	if (id.x >= w || id.y >= h) return;\n"
+		"	dst[id.xy] = src[uint2(id.x, h - 1 - id.y)];\n"
+		"}\n";
+
+	bool EnsureFlip()
+	{
+		if (g.flipTried) return g.flipOk;
+		g.flipTried = true;
+		HMODULE dc = LoadLibraryW(L"d3dcompiler_47.dll");
+		D3DCompileFn compile = dc ? (D3DCompileFn)GetProcAddress(dc, "D3DCompile") : nullptr;
+		if (!compile) { Log("Hudless flip: d3dcompiler_47.dll not available (error %lu): the row copies do the flip.", GetLastError()); return false; }
+		ComPtr<ID3DBlob> cs, err;
+		HRESULT hr = compile(kFlipHlsl, sizeof kFlipHlsl - 1, "flip", nullptr, nullptr, "main", "cs_5_0", 0, 0, &cs, &err);
+		if (FAILED(hr)) { Log("Hudless flip: shader compile failed: 0x%08X %s; the row copies do the flip.", (unsigned)hr, err ? (const char*)err->GetBufferPointer() : ""); return false; }
+		D3D12_DESCRIPTOR_RANGE ranges[2] = {};
+		ranges[0].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; ranges[0].NumDescriptors = 1; ranges[0].BaseShaderRegister = 0; ranges[0].OffsetInDescriptorsFromTableStart = 0;
+		ranges[1].RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV; ranges[1].NumDescriptors = 1; ranges[1].BaseShaderRegister = 0; ranges[1].OffsetInDescriptorsFromTableStart = 1;
+		D3D12_ROOT_PARAMETER param = {};
+		param.ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		param.DescriptorTable.NumDescriptorRanges = 2;
+		param.DescriptorTable.pDescriptorRanges = ranges;
+		param.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		D3D12_ROOT_SIGNATURE_DESC rsd = {};
+		rsd.NumParameters = 1;
+		rsd.pParameters = &param;
+		ComPtr<ID3DBlob> sig, serr;
+		if (!Check(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &serr), "hudless flip root signature serialize")) return false;
+		if (!Check(g.d12->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(), IID_PPV_ARGS(&g.flipRs)), "hudless flip root signature")) return false;
+		D3D12_COMPUTE_PIPELINE_STATE_DESC pd = {};
+		pd.pRootSignature = g.flipRs.Get();
+		pd.CS.pShaderBytecode = cs->GetBufferPointer();
+		pd.CS.BytecodeLength = cs->GetBufferSize();
+		if (!Check(g.d12->CreateComputePipelineState(&pd, IID_PPV_ARGS(&g.flipPso)), "hudless flip pipeline")) { g.flipRs.Reset(); return false; }
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
+		hd.NumDescriptors = 2 * Slots;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		if (!Check(g.d12->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&g.flipHeap)), "hudless flip descriptor heap")) { g.flipPso.Reset(); g.flipRs.Reset(); return false; }
+		g.flipInc = g.d12->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV);
+		g.flipOk = true;
+		Log("Hudless flip: one compute dispatch per frame (cs_5_0, %u bytes).", (unsigned)cs->GetBufferSize());
+		return true;
+	}
+
 	void Fail(const char* why)
 	{
 		Log("FSR stopped: %s", why);
@@ -627,7 +772,8 @@ namespace
 		void* p = nullptr;
 		if (FAILED(g.readback->Map(0, &r, &p))) return;
 		const uint64_t* t = (const uint64_t*)((const char*)p + r.Begin);
-		if (t[1] > t[0]) Average(g.stats.gpuMs, (t[1] - t[0]) * g.tickMs);
+		if (t[1] > t[0]) Average(g.slotFg[slot] ? g.stats.fgGpuMs : g.stats.gpuMs, (t[1] - t[0]) * g.tickMs);
+		g.slotFg[slot] = false;
 		D3D12_RANGE none = { 0, 0 };
 		g.readback->Unmap(0, &none);
 	}
@@ -685,7 +831,174 @@ namespace
 	Handed g_handed = { -1 };
 
 	void TimingMark(int code);
-	const uint32_t DirectColor = 1, DirectOutput = 2, DirectMotion = 4;
+	const uint32_t DirectColor = 1, DirectOutput = 2, DirectMotion = 4, DirectHudless = 8;
+
+	void ListFgProviders()
+	{
+		if (g.fgProvidersListed) return;
+		g.fgProvidersListed = true;
+		uint64_t count = 0;
+		ffxQueryDescGetVersions vq = {};
+		vq.header.type = FFX_API_QUERY_DESC_TYPE_GET_VERSIONS;
+		vq.createDescType = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+		vq.device = g.d12.Get();
+		vq.outputCount = &count;
+		ffxReturnCode_t rc = g.fx.Query(nullptr, &vq.header);
+		uint64_t ids[16] = {};
+		const char* names[16] = {};
+		if (rc == FFX_API_RETURN_OK && count)
+		{
+			if (count > 16) count = 16;
+			vq.versionIds = ids;
+			vq.versionNames = names;
+			rc = g.fx.Query(nullptr, &vq.header);
+		}
+		if (rc != FFX_API_RETURN_OK) { Log("FG providers: the version query failed (%u).", rc); return; }
+		std::string list;
+		for (uint64_t i = 0; i < count; i++)
+		{
+			char item[96];
+			snprintf(item, sizeof item, "%s'%s' (id 0x%llX)", i ? ", " : "", names[i] ? names[i] : "?", (unsigned long long)ids[i]);
+			list += item;
+		}
+		Log("FG providers on this GPU (%llu): %s.", (unsigned long long)count, list.c_str());
+	}
+
+	bool EnsureFg(const FrameData& fd, uint32_t keyW, uint32_t keyH)
+	{
+		uint32_t flags = (fd.createFlags & FFX_UPSCALE_ENABLE_DEPTH_INVERTED) ? FFX_FRAMEGENERATION_ENABLE_DEPTH_INVERTED : 0;
+		if (g.fg && g.fgDisplayW == fd.displayW && g.fgDisplayH == fd.displayH && g.fgRenderW == keyW && g.fgRenderH == keyH && g.fgFlags == flags) return true;
+		if (!WaitIdle("new FG context")) return false;
+		DestroyFg();
+		ListFgProviders();
+		ffxCreateBackendDX12Desc backend = {};
+		backend.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_BACKEND_DX12;
+		backend.device = g.d12.Get();
+		ffxCreateContextDescFrameGenerationVersion version = {};
+		version.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION_VERSION;
+		version.version = FFX_FRAMEGENERATION_VERSION;
+		ffxCreateContextDescFrameGeneration desc = {};
+		desc.header.type = FFX_API_CREATE_CONTEXT_DESC_TYPE_FRAMEGENERATION;
+		desc.flags = flags;
+		desc.displaySize = { fd.displayW, fd.displayH };
+		desc.maxRenderSize = { keyW, keyH };
+		desc.backBufferFormat = FFX_API_SURFACE_FORMAT_R8G8B8A8_UNORM;
+		desc.header.pNext = &backend.header;
+		backend.header.pNext = &version.header;
+		ffxReturnCode_t rc = g.fx.CreateContext(&g.fg, &desc.header, nullptr);
+		if (rc != FFX_API_RETURN_OK) { Log("FG ffxCreateContext failed: %u.", rc); g.fg = nullptr; CheckRemoved(); return false; }
+		g.fgDisplayW = fd.displayW; g.fgDisplayH = fd.displayH; g.fgRenderW = keyW; g.fgRenderH = keyH; g.fgFlags = flags;
+		g.fgHavePrevious = false;
+		made = true;
+		ffxConfigureDescGlobalDebug dbg = {};
+		dbg.header.type = FFX_API_CONFIGURE_DESC_TYPE_GLOBALDEBUG;
+		dbg.effectId = FFX_API_EFFECT_ID_FRAMEGENERATION;
+		dbg.fpMessage = OnFfxMessage;
+		g.fx.Configure(&g.fg, &dbg.header);
+		ffxQueryGetProviderVersion pv = {};
+		pv.header.type = FFX_API_QUERY_DESC_TYPE_GET_PROVIDER_VERSION;
+		if (g.fx.Query(&g.fg, &pv.header) == FFX_API_RETURN_OK && pv.versionName)
+		{
+			g.stats.fgProviderId = pv.versionId;
+			snprintf(g.stats.fgProvider, sizeof g.stats.fgProvider, "%s", pv.versionName);
+		}
+		FfxApiEffectMemoryUsage mem = {};
+		ffxQueryDescFrameGenerationGetGPUMemoryUsage mq = {};
+		mq.header.type = FFX_API_QUERY_DESC_TYPE_FRAMEGENERATION_GPU_MEMORY_USAGE;
+		mq.gpuMemoryUsageFrameGeneration = &mem;
+		ffxReturnCode_t mrc = g.fx.Query(&g.fg, &mq.header);
+		g.stats.fgMemory = mrc == FFX_API_RETURN_OK ? mem.totalUsageInBytes : 0;
+		Log("FG context: inputs up to %ux%u, display %ux%u, flags 0x%X: provider '%s' (id 0x%llX); GPU memory %.1f MB%s; manual dispatch, presented through the game's swap chain.",
+			keyW, keyH, fd.displayW, fd.displayH, flags, g.stats.fgProvider, (unsigned long long)g.stats.fgProviderId, mem.totalUsageInBytes / 1048576.0, mrc == FFX_API_RETURN_OK ? "" : " (query failed)");
+		return true;
+	}
+
+	void FgPrepare(const FrameData& fd, ID3D12GraphicsCommandList* l, uint32_t keyW, uint32_t keyH)
+	{
+		if (!fd.fg)
+		{
+			if (g.fg && WaitIdle("FG off")) DestroyFg();
+			g.fgPending = false;
+			if (!g.fgOffLogged) { g.fgOffLogged = true; Log("FG off."); }
+			return;
+		}
+		if (!EnsureFg(fd, keyW, keyH)) { g.fgPending = false; return; }
+		uint64_t id = ++g.fgFrameId;
+		ffxConfigureDescFrameGeneration c = {};
+		c.header.type = FFX_API_CONFIGURE_DESC_TYPE_FRAMEGENERATION;
+		c.swapChain = nullptr;
+		c.frameGenerationEnabled = true;
+		c.flags = FFX_FRAMEGENERATION_FLAG_NO_SWAPCHAIN_CONTEXT_NOTIFY;
+		c.generationRect = { 0, 0, (int32_t)fd.displayW, (int32_t)fd.displayH };
+		c.frameID = id;
+		g.fgPendingHud = false;
+		if (fd.hudless) MakeShared(g.hudless, fd.displayW, fd.displayH, DXGI_FORMAT_R8G8B8A8_UNORM, false, "hudless", true, -1);
+		if (fd.hudless && (fd.direct & DirectHudless) && g.hudless.t12)
+		{
+			g.fgPendingHud = true;
+			if (!g.hudUp || g.hudUpW != g.hudless.w || g.hudUpH != g.hudless.h)
+			{
+				g.hudUp.Reset();
+				D3D12_HEAP_PROPERTIES hp = {};
+				hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+				D3D12_RESOURCE_DESC td = {};
+				td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+				td.Width = g.hudless.w;
+				td.Height = g.hudless.h;
+				td.DepthOrArraySize = td.MipLevels = 1;
+				td.Format = g.hudless.fmt;
+				td.SampleDesc.Count = 1;
+				td.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+				if (Check(g.d12->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &td, D3D12_RESOURCE_STATE_COPY_DEST, nullptr, IID_PPV_ARGS(&g.hudUp)), "hudless (upright) texture"))
+				{ g.hudUpW = g.hudless.w; g.hudUpH = g.hudless.h; g.hudUpState = D3D12_RESOURCE_STATE_COPY_DEST; }
+			}
+			if (g.hudUp) c.HUDLessColor = ffxApiGetResourceDX12(g.hudUp.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+			else g.fgPendingHud = false;
+		}
+		ffxReturnCode_t rc = g.fx.Configure(&g.fg, &c.header);
+		if (rc != FFX_API_RETURN_OK) { if (++g.fgErrors <= 3) Log("FG configure failed: %u (frame %llu).", rc, (unsigned long long)id); g.fgPending = false; return; }
+		ffxDispatchDescFrameGenerationPrepareV2 p = {};
+		p.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION_PREPARE_V2;
+		p.frameID = id;
+		p.flags = c.flags;
+		p.commandList = l;
+		p.renderSize = { fd.renderW, fd.renderH };
+		p.jitterOffset = { fd.jitterX, fd.jitterY };
+		p.motionVectorScale = { fd.mvScaleX, fd.mvScaleY };
+		p.frameTimeDelta = fd.frameTimeMs;
+		p.reset = fd.reset != 0;
+		p.cameraNear = fd.cameraNear;
+		p.cameraFar = fd.cameraFar;
+		p.cameraFovAngleVertical = fd.fovV;
+		p.viewSpaceToMetersFactor = 1.0f;
+		p.depth = ffxApiGetResourceDX12(g.depth.t12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+		p.motionVectors = ffxApiGetResourceDX12(g.motion.t12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+		memcpy(p.cameraPosition, fd.camPos, sizeof p.cameraPosition);
+		memcpy(p.cameraUp, fd.camUp, sizeof p.cameraUp);
+		memcpy(p.cameraRight, fd.camRight, sizeof p.cameraRight);
+		memcpy(p.cameraForward, fd.camFwd, sizeof p.cameraForward);
+		rc = g.fx.Dispatch(&g.fg, &p.header);
+		if (rc != FFX_API_RETURN_OK) { if (++g.fgErrors <= 3) Log("FG prepare failed: %u (frame %llu).", rc, (unsigned long long)id); g.fgPending = false; return; }
+		g.stats.fgPrepared++;
+		g.fgPending = true;
+		g.fgPendingReset = fd.reset != 0;
+		if (g.fgOffLogged) { g.fgOffLogged = false; Log("FG on: frames prepared after the upscale, generated at the game's Present (hook %s).", PresentHooked() ? "in place" : "NOT in place: nothing is shown until it is"); }
+	}
+
+	void Pace(LONGLONG from, double ms)
+	{
+		LARGE_INTEGER f, now;
+		QueryPerformanceFrequency(&f);
+		LONGLONG until = from + (LONGLONG)(ms * f.QuadPart / 1000.0);
+		for (;;)
+		{
+			QueryPerformanceCounter(&now);
+			LONGLONG left = until - now.QuadPart;
+			if (left <= 0) return;
+			if (left * 1000.0 / f.QuadPart > 1.5) Sleep(1);
+			else YieldProcessor();
+		}
+	}
 
 	void Upscale(const FrameData& handed)
 	{
@@ -767,6 +1080,12 @@ namespace
 		ffxReturnCode_t rc = g.fx.Dispatch(&g.fsr, &d.header);
 		l->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
 		g.stats.lastResult = (int32_t)rc;
+		{
+			bool dynamic = (fd.createFlags & FFX_UPSCALE_ENABLE_DYNAMIC_RESOLUTION) != 0;
+			uint32_t keyW = dynamic ? (fd.maxRenderW > fd.renderW ? fd.maxRenderW : fd.renderW) : fd.renderW;
+			uint32_t keyH = dynamic ? (fd.maxRenderH > fd.renderH ? fd.maxRenderH : fd.renderH) : fd.renderH;
+			FgPrepare(fd, l, keyW, keyH);
+		}
 
 		for (int i = 0; i < 4; i++)
 		{
@@ -832,6 +1151,7 @@ namespace
 			else if (eventId == 2) Release();
 			else if (eventId == 3) g.stats.presented++;
 			else if (eventId >= 100 && eventId < 100 + TCodes) TimingMark(eventId - 100);
+			else if (eventId >= 4 && eventId <= 6) PresentEvent(eventId);
 		}
 		__except (EXCEPTION_EXECUTE_HANDLER)
 		{
@@ -847,6 +1167,215 @@ namespace
 	}
 }
 
+void BridgeLog(const char* fmt, ...)
+{
+	char buf[1024];
+	va_list a;
+	va_start(a, fmt);
+	vsnprintf(buf, sizeof buf, fmt, a);
+	va_end(a);
+	Log("%s", buf);
+}
+
+ID3D12CommandQueue* BridgeQueue() { return g.queue.Get(); }
+
+bool FgPresentInner(IDXGISwapChain* sc, UINT sync, UINT flags, PresentFn original, HRESULT* hr);
+
+bool FgPresent(IDXGISwapChain* sc, UINT sync, UINT flags, PresentFn original, HRESULT* hr)
+{
+	__try
+	{
+		return FgPresentInner(sc, sync, flags, original, hr);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		DWORD code = GetExceptionCode();
+		if (code == EXCEPTION_ACCESS_VIOLATION || code == EXCEPTION_IN_PAGE_ERROR || code == EXCEPTION_STACK_OVERFLOW) g.fatal = true;
+		g.teardownDue = true;
+		g.stats.failures++;
+		g.failed = true;
+		Log("FSR stopped: exception 0x%08X in frame generation at present%s.", (unsigned)code, g.fatal ? " (a memory fault: off until the game restarts)" : "");
+		return false;
+	}
+}
+
+bool FgPresentInner(IDXGISwapChain* sc, UINT sync, UINT flags, PresentFn original, HRESULT* hr)
+{
+	if (!g.fg || !g.fgPending || g.failed || deviceLost) return false;
+	g.fgPending = false;
+	LARGE_INTEGER entry, qf;
+	QueryPerformanceCounter(&entry);
+	QueryPerformanceFrequency(&qf);
+	if (g.fgLastEntry)
+	{
+		double dt = (double)(entry.QuadPart - g.fgLastEntry);
+		if (dt > 0 && dt < qf.QuadPart) g.fgIntervalTicks = g.fgIntervalTicks == 0 ? dt : g.fgIntervalTicks + (dt - g.fgIntervalTicks) / 8.0;
+	}
+	g.fgLastEntry = entry.QuadPart;
+	g.stats.fgIntervalMs = (float)(g.fgIntervalTicks * 1000.0 / qf.QuadPart);
+	if (g.fgRefreshFrames++ % 600 == 0)
+	{
+		ComPtr<IDXGISwapChain1> sc1;
+		HWND hwnd = nullptr;
+		if (SUCCEEDED(sc->QueryInterface(IID_PPV_ARGS(&sc1)))) sc1->GetHwnd(&hwnd);
+		MONITORINFOEXW mi = {};
+		mi.cbSize = sizeof mi;
+		DEVMODEW dm = {};
+		dm.dmSize = sizeof dm;
+		if (hwnd && GetMonitorInfoW(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST), &mi) && EnumDisplaySettingsW(mi.szDevice, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+			g.stats.fgRefreshHz = (float)dm.dmDisplayFrequency;
+	}
+	double refreshMs = g.stats.fgRefreshHz > 1 ? 1000.0 / g.stats.fgRefreshHz : 0.0;
+	double intervalMs = g.fgIntervalTicks * 1000.0 / qf.QuadPart;
+	if (refreshMs > 0 && intervalMs > 0 && intervalMs < 2.0 * refreshMs * 0.98)
+	{
+		g.stats.fgNotNeeded++;
+		g.fgHavePrevious = false;
+		return false;
+	}
+
+	ComPtr<ID3D11Texture2D> bb;
+	if (FAILED(sc->GetBuffer(0, IID_PPV_ARGS(&bb)))) { g.stats.fgSkipped++; return false; }
+	D3D11_TEXTURE2D_DESC bd;
+	bb->GetDesc(&bd);
+	if (bd.Width != g.fgDisplayW || bd.Height != g.fgDisplayH) { g.stats.fgSkipped++; return false; }
+	bool showGenerated = !g.fgPendingReset && g.fgHavePrevious;
+	bool ok = EnsureShared(g.present, bb.Get(), false, "present colour", false) && EnsureShared(g.gen, bb.Get(), true, "generated frame", false);
+	if (!ok) { Fail("FG shared textures (above)."); return false; }
+
+	int slot = (int)(g.submits % Slots);
+	if (!WaitOut(g.allocFence[slot], FrameWaitMs, "FG command allocator reuse")) { Fail("the GPU stopped making progress (above)."); return false; }
+	ReadTimestamps(slot);
+	ID3D12GraphicsCommandList* l = g.list[slot].Get();
+	if (!Check(g.alloc[slot]->Reset(), "FG command allocator Reset") || !Check(l->Reset(g.alloc[slot].Get(), nullptr), "FG command list Reset")) { Fail("FG command list (above)."); return false; }
+
+	g.ctx->CopyResource(g.present.t11.Get(), bb.Get());
+	bool hud = g.fgPendingHud && g.hudless.t11;
+	uint64_t ready = ++g.inValue;
+	if (!Check(g.ctx->Signal(g.in11.Get(), ready), "D3D11 Signal (FG)")) { l->Close(); Fail("fence (above)."); return false; }
+	g.ctx->Flush();
+
+	D3D12_RESOURCE_BARRIER in[3], out[3];
+	int nb = hud ? 3 : 2;
+	Barrier(g.present.t12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, in[0]);
+	Barrier(g.gen.t12.Get(), D3D12_RESOURCE_STATE_COMMON, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, in[1]);
+	bool flip = hud && EnsureFlip();
+	if (hud) Barrier(g.hudless.t12.Get(), D3D12_RESOURCE_STATE_COMMON, flip ? D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE : D3D12_RESOURCE_STATE_COPY_SOURCE, in[2]);
+	l->ResourceBarrier(nb, in);
+	if (hud && flip)
+	{
+		D3D12_RESOURCE_BARRIER hb;
+		if (g.hudUpState != D3D12_RESOURCE_STATE_UNORDERED_ACCESS) { Barrier(g.hudUp.Get(), g.hudUpState, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, hb); l->ResourceBarrier(1, &hb); }
+		D3D12_CPU_DESCRIPTOR_HANDLE cpu = g.flipHeap->GetCPUDescriptorHandleForHeapStart();
+		D3D12_GPU_DESCRIPTOR_HANDLE gpu = g.flipHeap->GetGPUDescriptorHandleForHeapStart();
+		cpu.ptr += (SIZE_T)slot * 2 * g.flipInc;
+		gpu.ptr += (UINT64)slot * 2 * g.flipInc;
+		D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+		sv.Format = g.hudless.fmt;
+		sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+		sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+		sv.Texture2D.MipLevels = 1;
+		g.d12->CreateShaderResourceView(g.hudless.t12.Get(), &sv, cpu);
+		D3D12_UNORDERED_ACCESS_VIEW_DESC uv = {};
+		uv.Format = g.hudless.fmt;
+		uv.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+		D3D12_CPU_DESCRIPTOR_HANDLE cpuUav = cpu;
+		cpuUav.ptr += g.flipInc;
+		g.d12->CreateUnorderedAccessView(g.hudUp.Get(), nullptr, &uv, cpuUav);
+		ID3D12DescriptorHeap* heaps[] = { g.flipHeap.Get() };
+		l->SetDescriptorHeaps(1, heaps);
+		l->SetComputeRootSignature(g.flipRs.Get());
+		l->SetPipelineState(g.flipPso.Get());
+		l->SetComputeRootDescriptorTable(0, gpu);
+		l->Dispatch((g.hudUpW + 7) / 8, (g.hudUpH + 7) / 8, 1);
+		Barrier(g.hudUp.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hb);
+		l->ResourceBarrier(1, &hb);
+		g.hudUpState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		g.flipDispatches++;
+	}
+	else if (hud)
+	{
+		D3D12_RESOURCE_BARRIER hb;
+		if (g.hudUpState != D3D12_RESOURCE_STATE_COPY_DEST) { Barrier(g.hudUp.Get(), g.hudUpState, D3D12_RESOURCE_STATE_COPY_DEST, hb); l->ResourceBarrier(1, &hb); }
+		D3D12_TEXTURE_COPY_LOCATION dst = {}, src = {};
+		dst.pResource = g.hudUp.Get(); dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src.pResource = g.hudless.t12.Get(); src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		for (UINT y = 0; y < g.hudUpH; y++)
+		{
+			D3D12_BOX box = { 0, y, 0, g.hudUpW, y + 1, 1 };
+			l->CopyTextureRegion(&dst, 0, g.hudUpH - 1 - y, 0, &src, &box);
+		}
+		Barrier(g.hudUp.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE, hb);
+		l->ResourceBarrier(1, &hb);
+		g.hudUpState = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
+		g.flipRowCopies++;
+	}
+	ffxDispatchDescFrameGeneration d = {};
+	d.header.type = FFX_API_DISPATCH_DESC_TYPE_FRAMEGENERATION;
+	d.commandList = l;
+	d.presentColor = ffxApiGetResourceDX12(g.present.t12.Get(), FFX_API_RESOURCE_STATE_COMPUTE_READ);
+	d.outputs[0] = ffxApiGetResourceDX12(g.gen.t12.Get(), FFX_API_RESOURCE_STATE_UNORDERED_ACCESS);
+	d.numGeneratedFrames = 1;
+	d.reset = g.fgPendingReset || !g.fgHavePrevious;
+	d.backbufferTransferFunction = FFX_API_BACKBUFFER_TRANSFER_FUNCTION_SRGB;
+	d.minMaxLuminance[0] = 0.0f;
+	d.minMaxLuminance[1] = 1.0f;
+	d.generationRect = { 0, 0, (int32_t)g.fgDisplayW, (int32_t)g.fgDisplayH };
+	d.frameID = g.fgFrameId;
+	l->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2);
+	ffxReturnCode_t rc = g.fx.Dispatch(&g.fg, &d.header);
+	l->EndQuery(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2 + 1);
+	g.stats.fgLastResult = (int32_t)rc;
+	for (int i = 0; i < nb; i++) { out[i] = in[i]; std::swap(out[i].Transition.StateBefore, out[i].Transition.StateAfter); }
+	l->ResourceBarrier(nb, out);
+	l->ResolveQueryData(g.timestamps.Get(), D3D12_QUERY_TYPE_TIMESTAMP, slot * 2, 2, g.readback.Get(), slot * 2 * sizeof(uint64_t));
+	if (!Check(l->Close(), "FG command list Close")) { Fail("FG command list (above)."); return false; }
+	if (!Check(g.queue->Wait(g.in12.Get(), ready), "queue Wait (FG)")) { Fail("fence (above)."); return false; }
+	ID3D12CommandList* lists[] = { l };
+	g.queue->ExecuteCommandLists(1, lists);
+	uint64_t done = ++g.outValue;
+	if (!Check(g.queue->Signal(g.out12.Get(), done), "queue Signal (FG)")) { Fail("fence (above)."); return false; }
+	g.allocFence[slot] = done;
+	g.slotTimed[slot] = true;
+	g.slotFg[slot] = true;
+	g.submits++;
+	if (!Check(g.ctx->Wait(g.out11.Get(), done), "D3D11 Wait (FG)")) { Fail("fence (above)."); return false; }
+	if (rc != FFX_API_RETURN_OK)
+	{
+		if (++g.fgErrors <= 3) Log("FG dispatch failed: %u (frame %llu).", rc, (unsigned long long)g.fgFrameId);
+		g.stats.fgSkipped++;
+		g.fgHavePrevious = false;
+		CheckRemoved();
+		return false;
+	}
+	g.fgHavePrevious = !g.fgPendingReset;
+	if (!showGenerated) { g.stats.fgSkipped++; return false; }
+
+	g.ctx->CopyResource(bb.Get(), g.gen.t11.Get());
+	*hr = original(sc, sync, flags);
+	g.stats.fgGenerated++;
+	if (hud) g.stats.fgHudless++;
+	LARGE_INTEGER t1;
+	QueryPerformanceCounter(&t1);
+	double half = intervalMs * 0.5;
+	if (half > 0 && (sync == 0 || refreshMs == 0 || half > refreshMs)) Pace(entry.QuadPart, half);
+	LARGE_INTEGER t2;
+	QueryPerformanceCounter(&t2);
+	Average(g.stats.fgPaceMs, (t2.QuadPart - t1.QuadPart) * 1000.0 / qf.QuadPart);
+	ComPtr<ID3D11Texture2D> bb2;
+	if (SUCCEEDED(sc->GetBuffer(0, IID_PPV_ARGS(&bb2))) && bb2)
+	{
+		g.ctx->CopyResource(bb2.Get(), g.present.t11.Get());
+		*hr = original(sc, sync, flags);
+		g.stats.fgReal++;
+	}
+	LARGE_INTEGER t3;
+	QueryPerformanceCounter(&t3);
+	Average(g.stats.fgHookMs, (t3.QuadPart - entry.QuadPart) * 1000.0 / qf.QuadPart);
+	Publish();
+	return true;
+}
+
 EXPORT int FSR4_Load(const wchar_t* dir)
 {
 	if (g.loaded) return 1;
@@ -854,6 +1383,9 @@ EXPORT int FSR4_Load(const wchar_t* dir)
 	if (!d.empty() && d.back() != L'\\') d += L'\\';
 	g.upscalerDll = LoadLibraryExW((d + L"amd_fidelityfx_upscaler_dx12.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (!g.upscalerDll) { Log("Could not load amd_fidelityfx_upscaler_dx12.dll: error %lu.", GetLastError()); return 0; }
+	g.fgDll = LoadLibraryExW((d + L"amd_fidelityfx_framegeneration_dx12.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
+	if (!g.fgDll) Log("Could not load amd_fidelityfx_framegeneration_dx12.dll: error %lu (frame generation unavailable).", GetLastError());
+	timeBeginPeriod(1);
 	g.loaderDll = LoadLibraryExW((d + L"amd_fidelityfx_loader_dx12.dll").c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (!g.loaderDll) { Log("Could not load amd_fidelityfx_loader_dx12.dll: error %lu.", GetLastError()); return 0; }
 	ffxLoadFunctions(&g.fx, g.loaderDll);
@@ -915,6 +1447,13 @@ EXPORT uint64_t FSR4_GetViews(void** color, void** motion, void** output)
 	std::lock_guard<std::mutex> l(g_viewLock);
 	*color = g.color.srv.Get(); *motion = g.motion.srv.Get(); *output = g.output.srv.Get();
 	return *color && *motion && *output ? g_viewGen : 0;
+}
+
+EXPORT uint64_t FSR4_GetHudlessView(void** hudless)
+{
+	std::lock_guard<std::mutex> l(g_viewLock);
+	*hudless = g.hudless.srv.Get();
+	return *hudless ? g_viewGen : 0;
 }
 
 EXPORT void FSR4_ViewsInUse(uint64_t gen)
